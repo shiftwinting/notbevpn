@@ -20,6 +20,8 @@
 #include <bsdinet/tcpup.h>
 #include <base_link.h>
 
+#define SEQ_LT(a, b) ((int)((a) - (b)) < 0)
+
 // iptables -A PREROUTING -t raw -p tcp -m tcp --sport 16448 --dport 16448 -j NOTRACK
 // iptables -A OUTPUT -t raw -p tcp -m tcp --sport 16448 --dport 16448 -j NOTRACK
 // iptables -A OUTPUT -p tcp --sport 16448 --tcp-flags RST RST --dport 16448 -j DROP
@@ -47,10 +49,10 @@ static struct tcphdr TUNNEL_PADDIND_DNS = {
 
 #define LEN_PADDING_DNS sizeof(TUNNEL_PADDIND_DNS)
 
-static int _tcp_nxt = 0;
 static int _tcp_una = 0;
-static int _tcp_last = 0;
-static int _tcp_segment_len = 0;
+static int _tcp_nxt = 0x100;
+static int _tcp_max = 0x100;
+static int _tcp_flags = TH_SYN;
 
 static int _tcp_last_sum = 0;
 static in_addr_t _tcp_last_peer = 0;
@@ -107,9 +109,20 @@ static int tcp_low_link_recv_data(int devfd, void *buf, size_t len, struct socka
 		soinp->sin_port = phdr->th_sport;
 	}
 
-	assert ((phdr->th_flags & TH_RST) == 0);
-	if ((htonl(phdr->th_seq) + count - _tcp_una) > 0) {
+	int flags = phdr->th_flags & (TH_SYN| TH_ACK);
+	if (flags == TH_SYN) {
+		_tcp_flags = TH_SYN| TH_ACK;
+		_tcp_nxt = 0x100;
+		_tcp_max = 0x100;
+		_tcp_una = htonl(phdr->th_seq) + count +1;
+	} else if (flags == (TH_SYN|TH_ACK) && _tcp_flags != TH_ACK) {
+		_tcp_flags = TH_ACK;
+		_tcp_una = htonl(phdr->th_seq) + count +1;
+	} else if (SEQ_LT(_tcp_una, htonl(phdr->th_seq) + count)) {
+		_tcp_flags = TH_ACK;
 		_tcp_una = htonl(phdr->th_seq) + count;
+	} else {
+		_tcp_flags = TH_ACK;
 	}
 
 	LOG_VERBOSE("recv: %ld\n", count + LEN_PADDING_DNS);
@@ -166,7 +179,7 @@ static int tcp_low_link_send_data(int devfd, void *buf, size_t len, const struct
 
 	int optlen = 0;
 	unsigned char *optp = _crypt_stream + sizeof(TUNNEL_PADDIND_DNS);
-	if (_tcp_nxt == 0) {
+	if (_tcp_flags & TH_SYN) {
 		optlen  = 4;
 		*optp++ = 3;
 		*optp++ = 3;
@@ -177,12 +190,16 @@ static int tcp_low_link_send_data(int devfd, void *buf, size_t len, const struct
 
 	struct tcphdr *phdr = (struct tcphdr *)_crypt_stream;
 
-	_tcp_segment_len += len;
-	phdr->th_seq = htonl(_tcp_nxt - _tcp_segment_len);
+	if (_tcp_flags & TH_SYN) {
+		_tcp_nxt = 0x100;
+		if (_tcp_flags == TH_SYN) _tcp_max = 0x100;
+		phdr->th_seq = htonl(_tcp_nxt -1);
+	} else {
+		phdr->th_seq = htonl(_tcp_nxt);
+	}
 	phdr->th_ack = htonl(_tcp_una);
 	phdr->th_off = (20 + optlen) >> 2;
-	phdr->th_flags = (_tcp_nxt == 0? TH_SYN: 0)|(_tcp_una == 0? 0: TH_ACK);
-	// phdr->th_flags = (_tcp_nxt == 0? TH_SYN: TH_SYN)|(_tcp_una == 0? 0: TH_ACK);
+	phdr->th_flags = _tcp_flags;
 
 	struct sockaddr_in *soinp = (struct sockaddr_in *)ll_addr;
 	if (soinp->sin_addr.s_addr != _tcp_last_peer) {
@@ -196,11 +213,11 @@ static int tcp_low_link_send_data(int devfd, void *buf, size_t len, const struct
 
 	phdr->th_dport = soinp->sin_port;
 	phdr->th_sum = tcp_checksum(_tcp_last_sum, _crypt_stream, optlen + len + sizeof(TUNNEL_PADDIND_DNS));
-	// _tcp_nxt += len;
-	if (_tcp_last + _tcp_segment_len >= _tcp_nxt) {
-		_tcp_segment_len = 0;
-		_tcp_last = _tcp_nxt;
-		_tcp_nxt += (3 * len);
+
+	if (SEQ_LT(_tcp_max, _tcp_nxt + len)) {
+		_tcp_max = _tcp_nxt + len;
+	} else {
+		_tcp_nxt = _tcp_max - 1;
 	}
 
 	assert (optlen + len + sizeof(TUNNEL_PADDIND_DNS) + 20 <= 1500);
@@ -210,7 +227,7 @@ static int tcp_low_link_send_data(int devfd, void *buf, size_t len, const struct
 static int tcp_low_link_adjust(void)
 {
 	/* sizeof(struct tcphdr) == 20 */
-	return LEN_PADDING_DNS;
+	return LEN_PADDING_DNS + 4;
 }
 
 struct low_link_ops tcp_ops = {
