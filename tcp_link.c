@@ -22,9 +22,9 @@
 
 #define SEQ_LT(a, b) ((int)((a) - (b)) < 0)
 
-// iptables -A PREROUTING -t raw -p tcp -m tcp --sport 16448 --dport 16448 -j NOTRACK
-// iptables -A OUTPUT -t raw -p tcp -m tcp --sport 16448 --dport 16448 -j NOTRACK
-// iptables -A OUTPUT -p tcp --sport 16448 --tcp-flags RST RST --dport 16448 -j DROP
+// iptables -A PREROUTING -t raw -p tcp -m tcp --dport 16448 -j NOTRACK
+// iptables -A OUTPUT -t raw -p tcp -m tcp --sport 16448 -j NOTRACK
+// iptables -A OUTPUT -p tcp --sport 16448 --tcp-flags RST RST -j DROP
 
 /*
  * phy_dev=eth1
@@ -151,19 +151,30 @@ static in_addr_t get_local_name(int devfd, const struct sockaddr *ll_addr, size_
 		}
 	}
 
-	error = connect(devfd, ll_addr, ll_len);
-	if (error != 0) {
+	if (_tcp_last_name != 0) {
 		return _tcp_last_name;
 	}
 
+	int udpfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (udpfd == -1) {
+		return _tcp_last_name;
+	}
+
+	error = connect(udpfd, ll_addr, ll_len);
+	if (error != 0) {
+		tcp_name = _tcp_last_name;
+		assert(0);
+		goto disconnect;
+	}
+
 	selflen = sizeof(self);
-	error = getsockname(devfd, (struct sockaddr *)&self, &selflen);
+	error = getsockname(udpfd, (struct sockaddr *)&self, &selflen);
 	if (error == 0 && self.sin_addr.s_addr != 0) {
 		tcp_name = self.sin_addr.s_addr;
 	}
 
-	self.sin_family = AF_UNSPEC;
-	error = connect(devfd, (struct sockaddr *)&self, sizeof(self));
+disconnect:
+	close(udpfd);
 
 	return tcp_name;
 }
@@ -214,10 +225,15 @@ static int tcp_low_link_send_data(int devfd, void *buf, size_t len, const struct
 	phdr->th_dport = soinp->sin_port;
 	phdr->th_sum = tcp_checksum(_tcp_last_sum, _crypt_stream, optlen + len + sizeof(TUNNEL_PADDIND_DNS));
 
-	if (SEQ_LT(_tcp_max, _tcp_nxt + len)) {
+	if (SEQ_LT(_tcp_nxt + len, _tcp_max)) {
+		_tcp_nxt = _tcp_max;
+	} else if (SEQ_LT(_tcp_max, _tcp_nxt)) {
+		int tmp = _tcp_max;
 		_tcp_max = _tcp_nxt + len;
+		_tcp_nxt = tmp;
 	} else {
-		_tcp_nxt = _tcp_max - 1;
+		_tcp_max = _tcp_nxt + len;
+		_tcp_nxt = _tcp_nxt + len + len;
 	}
 
 	assert (optlen + len + sizeof(TUNNEL_PADDIND_DNS) + 20 <= 1500);
