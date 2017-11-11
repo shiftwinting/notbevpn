@@ -228,6 +228,7 @@ static int tcp_low_link_send_data(int devfd, void *buf, size_t len, const struct
 	}
 
 	assert (optlen + len + sizeof(TUNNEL_PADDIND_DNS) + 20 <= 1500);
+	protect_reset(IPPROTO_TCP, _crypt_stream, len, ll_addr, ll_len);
 	return sendto(devfd, _crypt_stream, optlen + len + sizeof(TUNNEL_PADDIND_DNS), 0, ll_addr, ll_len);
 }
 
